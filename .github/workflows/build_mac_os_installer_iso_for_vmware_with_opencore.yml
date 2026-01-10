@@ -1,0 +1,235 @@
+name: Build macOS Installer ISO for VMware with OpenCore
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos:
+        description: "macOS Version"
+        required: true
+        type: choice
+        options:
+          - Tahoe
+          - Sequoia
+          - Sonoma
+          - Ventura
+          - Monterey
+          - Big_Sur
+          - Catalina
+          - Mojave
+          - High_Sierra
+          - Sierra
+          - El_Capitan
+          - Yosemite
+          - Mavericks
+          - Mountain_Lion
+          - Lion
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 480
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+
+      - name: System Info
+        run: |
+          sw_vers
+          uname -m
+          df -h
+
+      - name: Install dependencies
+        run: |
+          brew update
+          brew install qemu unzip
+          brew list wget &>/dev/null || brew install wget
+
+      # ===============================
+      # Fetch OpenCore RELEASE
+      # ===============================
+      - name: Fetch OpenCore
+        run: |
+          set -e
+          wget -O OpenCore.zip https://github.com/acidanthera/OpenCorePkg/releases/download/0.9.9/OpenCore-0.9.9-RELEASE.zip
+          unzip -o OpenCore.zip
+          mkdir -p OC/EFI
+          cp -R X64/EFI/* OC/EFI/
+          cp Docs/Sample.plist OC/EFI/OC/config.plist
+          echo "✅ OpenCore fetched"
+
+      # ===============================
+      # Generate SMBIOS for VM
+      # ===============================
+      - name: Generate SMBIOS
+        run: |
+          CFG="OC/EFI/OC/config.plist"
+          UUID=$(uuidgen)
+          /usr/libexec/PlistBuddy -c "Set :PlatformInfo:Generic:SystemProductName iMacPro1,1" "$CFG"
+          /usr/libexec/PlistBuddy -c "Set :PlatformInfo:Generic:SystemUUID $UUID" "$CFG"
+          echo "✅ SMBIOS configured"
+
+      # ===============================
+      # Build macOS Installer ISO
+      # ===============================
+      - name: Build Installer ISO
+        run: |
+          set -e
+          VER="${{ inputs.macos }}"
+          VER_NAME=$(echo "$VER" | sed 's/_/ /g')
+          WORK="work-$VER"
+          mkdir -p "$WORK"
+          cd "$WORK"
+          echo "Selected macOS: $VER_NAME"
+
+          APP="/Applications/Install macOS $VER_NAME.app"
+
+          echo "Searching for latest version for $VER_NAME..."
+          FULL_VER=$(softwareupdate --list-full-installers | grep "$VER_NAME" | head -n 1 | awk -F 'Version: ' '{print $2}' | awk '{print $1}' | tr -d ',')
+          
+          if [ -z "$FULL_VER" ] || [ "$FULL_VER" = "Title:" ]; then
+            echo "⚠️ Auto-detection failed, using manual fallback..."
+            case "$VER" in
+              Tahoe) FULL_VER="15.0" ;;
+              Sequoia) FULL_VER="15.2" ;;
+              Sonoma) FULL_VER="14.7.2" ;;
+              Ventura) FULL_VER="13.7.1" ;;
+            esac
+          fi
+          echo "Version to download: $FULL_VER"
+
+          if [ ! -d "$APP" ]; then
+            MAX_RETRIES=5
+            COUNT=0
+            until [ -d "$APP" ] || [ $COUNT -ge $MAX_RETRIES ]
+            do
+              COUNT=$((COUNT+1))
+              echo "Attempt $COUNT/$MAX_RETRIES to download installer..."
+              sudo softwareupdate --fetch-full-installer --full-installer-version "$FULL_VER" || true
+              sleep 15
+            done
+            if [ ! -d "$APP" ]; then
+              echo "❌ Installer missing after retries: $APP"
+              exit 1
+            fi
+          else
+            echo "✅ Installer already exists: $APP"
+          fi
+
+          APP_SIZE=$(du -sm "$APP" | awk '{print $1}')
+          DMG_SIZE=$((APP_SIZE + 8192))
+          echo "Creating DMG of size ${DMG_SIZE}MB..."
+          
+          hdiutil create -size "${DMG_SIZE}m" -layout SPUD -fs "HFS+J" -volname "Install_macOS" installer.dmg
+
+          DMG_MOUNT="/Volumes/Install_macOS"
+          hdiutil attach installer.dmg -mountpoint "$DMG_MOUNT"
+          sudo "$APP/Contents/Resources/createinstallmedia" --volume "$DMG_MOUNT" --nointeraction
+
+          echo "Waiting for resources to clear..."
+          sleep 10
+          DEV=$(hdiutil info | grep "Install macOS $VER_NAME" | awk '{print $1}' | head -n 1)
+          if [ -n "$DEV" ]; then
+              diskutil unmountDisk force "$DEV"
+              hdiutil detach "$DEV" -force
+          fi
+          
+          sleep 5
+          hdiutil convert installer.dmg -format UDTO -o temp_installer
+          mv temp_installer.cdr installer.iso
+          
+          # Hapus file besar untuk hemat storage GitHub
+          rm installer.dmg
+          sudo rm -rf "$APP"
+          echo "✅ Installer ISO created"
+
+      # ===============================
+      # Create OpenCore Disk (FIXED)
+      # ===============================
+      - name: Create OpenCore Disk
+        run: |
+          set -e
+          WORK="work-${{ inputs.macos }}"
+          cd "$WORK"
+
+          # Fix: Menggunakan format direct FAT32 untuk menghindari Invalid Argument
+          hdiutil create -size 200m -fs "MS-DOS FAT32" -volname "EFI" oc.dmg
+
+          RAW_DEV=$(hdiutil attach -nomount oc.dmg | head -n 1 | awk '{print $1}')
+          echo "Attached raw device: $RAW_DEV"
+
+          EFI_DEV="${RAW_DEV}s1"
+          [ ! -e "$EFI_DEV" ] && EFI_DEV="$RAW_DEV"
+          
+          MOUNT_PATH=""
+          MAX_RETRIES=6
+          COUNT=0
+          until [ -n "$MOUNT_PATH" ] || [ $COUNT -ge $MAX_RETRIES ]
+          do
+              COUNT=$((COUNT+1))
+              echo "Mount attempt $COUNT/$MAX_RETRIES..."
+              diskutil mount "$EFI_DEV" || true
+              sleep 5
+              MOUNT_PATH=$(diskutil info "$EFI_DEV" | grep "Mount Point" | awk -F': ' '{print $2}' | xargs)
+          done
+
+          if [ -z "$MOUNT_PATH" ]; then
+             echo "❌ Failed to mount EFI partition"
+             exit 1
+          fi
+
+          echo "Successfully mounted at $MOUNT_PATH. Copying files..."
+          sudo mkdir -p "$MOUNT_PATH/EFI"
+          sudo cp -R ../OC/EFI/* "$MOUNT_PATH/EFI/"
+          
+          diskutil unmount "$EFI_DEV"
+          hdiutil detach "$RAW_DEV"
+
+          qemu-img convert -f raw -O vmdk oc.dmg OpenCore.vmdk
+          rm oc.dmg
+          echo "✅ OpenCore VMDK created"
+
+      # ===============================
+      # Create VMX
+      # ===============================
+      - name: Create VMX
+        run: |
+          WORK="work-${{ inputs.macos }}"
+          cd "$WORK"
+          printf '%s\n' \
+            'config.version = "8"' \
+            'virtualHW.version = "20"' \
+            'guestOS = "darwin64"' \
+            'firmware = "efi"' \
+            'memsize = "4096"' \
+            'numvcpus = "4"' \
+            'smc.present = "TRUE"' \
+            'sata0.present = "TRUE"' \
+            'sata0:0.fileName = "OpenCore.vmdk"' \
+            'sata0:1.present = "TRUE"' \
+            'sata0:1.fileName = "installer.iso"' \
+            'sata0:1.deviceType = "cdrom-image"' \
+            > macOS.vmx
+          echo "✅ VMX created"
+
+      # ===============================
+      # Generate SHA256
+      # ===============================
+      - name: Generate SHA256
+        run: |
+          WORK="work-${{ inputs.macos }}"
+          cd "$WORK"
+          shasum -a 256 installer.iso > installer.iso.sha256
+          echo "✅ SHA256 generated"
+
+      # ===============================
+      # Upload Artifacts
+      # ===============================
+      - name: Upload All Artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: macOS-${{ inputs.macos }}-VMware
+          path: work-${{ inputs.macos }}/**
